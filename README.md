@@ -1,6 +1,6 @@
 # Discord Bot
 ## Summary
-**THIS PROJECT HAS BEEN ARCHIVED**
+**THIS PROJECT HAS BEEN ARCHIVED**  
 This project was a valuable learning experience with PostgreSQL and WebSocket connections. 
 It is no longer being actively maintained, as I am shifting my focus toward team 
 projects and graphics programming.
