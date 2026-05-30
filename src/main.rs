@@ -16,15 +16,16 @@ use tokio_tungstenite::tungstenite::protocol::Message;
 // Postgres
 use tokio_postgres::Client;
 
+mod bot;
+
 #[tokio::main]
 async fn main() {
     dotenv::dotenv().expect("Should have loaded '.env' file");
 
     // Initialise database and WebSocket
     println!("Initialising connections...");
-    let db = Arc::new(init_db().await);
-    let s = Arc::new(AtomicU64::new(0));
-    let (wsw, mut wsr) = init_websocket(s.clone()).await;
+    let bot: bot::Bot = bot::Bot::new().await;
+    let (wsw, mut wsr) = init_websocket(bot.sequence.clone()).await;
 
     // Continue to read Discord event messages
     while let Message::Text(msg) = wsr.next().await.unwrap()
@@ -38,17 +39,17 @@ async fn main() {
                 let d = &data["d"];
                 let t = data["t"].as_str()
                     .expect("Should have read 't' from JSON object");
-                s.store(
+                bot.sequence.store(
                     data["s"].as_u64().expect("Should have read 's' from JSON object"),
                     Ordering::SeqCst,
                 );
 
-                event_handler(d, t, db.clone()).await;
+                event_handler(d, t, bot.database.clone()).await;
             },
 
             1 => wsw.lock().await.send(jstr(object!{
                     "op": 1,
-                    "d": s.load(Ordering::SeqCst)
+                    "d": bot.sequence.load(Ordering::SeqCst)
                 }).into()).await
                     .expect("Should have sent heartbeat after heartbeat request"),
 
@@ -65,30 +66,6 @@ async fn main() {
     }
 }
 
-async fn init_db() -> Client {
-    use tokio_postgres::{connect, NoTls};
-
-    let db_conf = format!(
-        "host={host} port={port} dbname={dbname} user={user} password={pass}",
-
-        host   = v("DB_HOST")        .expect("Env var 'DB_HOST' should be set"),
-        port   = v("DB_PORT")        .expect("Env var 'DB_PORT' should be set"),
-        dbname = v("DB_NAME")        .expect("Env var 'DB_NAME' should be set"),
-        user   = v("DISCORD_DB_USER").expect("Env var 'DISCORD_DB_USER' should be set"),
-        pass   = v("DISCORD_DB_PASS").expect("Env var 'DISCORD_DB_PASS' should be set"),
-    );
-
-    let (client, connection) = connect(db_conf.as_str(), NoTls).await
-        .expect("Should have connected to database");
-
-    tokio::spawn(async move {
-        connection.await.expect("Should have sent database connection to async block");
-    });
-
-    println!("Connection to database successful");
-    return client;
-}
-
 async fn init_websocket(s: Arc<AtomicU64>) -> (
     Arc<Mutex<SplitSink<WebSocketStream<MaybeTlsStream<TcpStream>>, Message>>>,
     SplitStream<WebSocketStream<MaybeTlsStream<TcpStream>>>
@@ -97,16 +74,17 @@ async fn init_websocket(s: Arc<AtomicU64>) -> (
     use tokio::time::{interval, Duration};
     use tokio_tungstenite::connect_async;
 
+    const GATEWAY_URL: &str = "wss://gateway.discord.gg/";
+
     // Initialise WebSocket
-    let url = v("GATEWAY_URL").expect("Env var 'GATEWAY_URL' should be set in '.env'");
-    let (websocket, _) = connect_async(url).await
+    let (websocket, _) = connect_async(GATEWAY_URL).await
         .expect("WebSocket should have connected");
     let (wsw, mut wsr) = websocket.split();
     let wsw = Arc::new(Mutex::new(wsw));
     println!("WebSocket initialised");
 
     // Build identity payload
-    let token   = v("GATEWAY_TOKEN")  .expect("env var 'GATEWAY_TOKEN' should be set");
+    let token   = v("DISCORD_TOKEN")  .expect("env var 'DISCORD_TOKEN' should be set");
     let os      = v("OS")             .expect("env var 'OS' should be set");
     let browser = v("BROWSER")        .expect("env var 'BROWSER' should be set");
     let device  = v("DEVICE")         .expect("env var 'DEVICE' should be set");
@@ -132,55 +110,58 @@ async fn init_websocket(s: Arc<AtomicU64>) -> (
 
     // Manage first payload
     if let Message::Text(msg) = wsr.next().await.unwrap()
-    .expect("WebSocket message should be readable") {
+            .expect("The WebSocket message should be readable") 
+            && to_json(&msg).unwrap()["op"].as_i8() == Some(10) {
+        let data = to_json(&msg).unwrap();
 
-        let data = to_json(&msg).expect("Message should be parsed to JSON");
+        let hwsw = Arc::downgrade(&wsw);
+        let hseq = Arc::downgrade(&s);
 
-        if data["op"].as_i8() == Some(10) {
-            let hwsw = Arc::downgrade(&wsw);
-            let hseq = Arc::downgrade(&s);
+        // Create heartbeat block
+        tokio::spawn(async move {
+            let mut timer = interval(Duration::from_millis(
+                data["d"]["heartbeat_interval"]
+                    .as_u64()
+                    .expect("Should have read 'heartbeat_interval' from JSON object")
+            ));
 
-            // Create heartbeat block
-            tokio::spawn(async move {
-                let mut timer = interval(Duration::from_millis(
-                    data["d"]["heartbeat_interval"]
-                        .as_u64()
-                        .expect("Should have read 'heartbeat_interval' from JSON object")
-                ));
+            loop {
+                timer.tick().await;
+                let heart_payload = jstr(object!{
+                    "op": 1,
+                    "d": hseq.upgrade()
+                        .unwrap()
+                        .load(Ordering::SeqCst),
+                });
 
-                loop {
-                    timer.tick().await;
-                    let heart_payload = jstr(object!{
-                        "op": 1,
-                        "d": hseq.upgrade().unwrap().load(Ordering::SeqCst),
-                    });
-
-                    hwsw.upgrade()
-                        .expect("Heartbeat's weak pointer to 'wsw' SplitSink should have upgraded")
-                        .lock().await.send(heart_payload.into()).await
-                        .expect("Should have sent heartbeat to Discord");
-                }
-            });
-
-            // Send Identify payload
-            let Message::Text(msg) = wsr.next().await.unwrap()
-                .expect("Should have read WebSocket message")
-            else {
-                panic!("Message was not Text when preparing to send identity payload");
-            };
-
-            let data = to_json(&msg)
-                .expect("Should have parsed WebSocket message to JSON");
-            let op = data["op"].as_i8()
-                .expect("Should have read 'op' from JSON object");
-
-            if op == 11 {
-                wsw.lock().await.send(jstr(identity_payload).into()).await
-                    .expect("Failed to send Identity payload");
-
-            } else {
-                todo!("Reconnect not yet handled");
+                hwsw.upgrade()
+                    .expect("Heartbeat's weak pointer to 'wsw' SplitSink should have upgraded")
+                    .lock().await
+                    .send(heart_payload.into()).await
+                    .expect("Should have sent heartbeat to Discord");
             }
+        });
+
+        // Send Identify payload
+        let Message::Text(msg) = wsr.next().await
+            .unwrap()
+            .expect("Should have read WebSocket message")
+        else {
+            panic!("Message was not Text when preparing to send identity payload");
+        };
+
+        let data = to_json(&msg)
+            .expect("Should have parsed WebSocket message to JSON");
+        let op = data["op"].as_i8()
+            .expect("Should have read 'op' from JSON object");
+
+        if op == 11 {
+            wsw.lock().await
+                .send(jstr(identity_payload).into()).await
+                .expect("Failed to send Identity payload");
+
+        } else {
+            todo!("Reconnect not yet handled");
         }
     }
 
