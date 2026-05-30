@@ -170,9 +170,12 @@ async fn init_websocket(s: Arc<AtomicU64>) -> (
         print!("Connect to voice channel? [y/N]: ");
         let _ = stdout().flush();
         let _ = stdin().read_line(&mut input);
+
         input.retain(|c| c != '\n' && c != '\r');
+
         if input == "Y" || input == "y" { break; }
         if input.len() == 0 || input == "N" || input == "n" { return (wsw, wsr); }
+
         input.truncate(0);
     }
     println!("Voice Gateway connection not yet implemented");
@@ -222,7 +225,7 @@ async fn insert_message(db: Arc<Client>, data: &JsonValue) {
     while let Some(obj) = iter.next() {mid_arr.push(obj["id"].as_str()
         .expect("Should have read 'id' from array 'mentions' in JSON object"));
     }
-    
+
     // Process mention_channels
     let mut mcid_arr = vec![];
     let mut iter = data["mention_channels"].members();
@@ -238,25 +241,15 @@ async fn insert_message(db: Arc<Client>, data: &JsonValue) {
         "content":             data["content"].as_str(),
         "timestamp":           data["timestamp"].as_str(),
         "edited_timestamp":    data["edited_timestamp"].as_str(),
-        "tts":                 data["tts"].as_str(),
         "mention_everyone":    data["mention_everyone"].as_str(),
         "mention_ids":         mid_arr,
         "mention_role_ids":    data["mention_roles"].clone(),
         "mention_channel_ids": mcid_arr,
-        "embeds":              data["embeds"].as_str(),
-        "reactions":           data["reactions"].as_str(),
         "nonce":               data["nonce"].as_str(),
-        "webhook_id":          data["webhook_id"].as_str(),
         "type":                data["type"].as_number(),
-        "flags":               data["flags"].as_number(),
         "msg_ref":             data["message_reference"].as_str(),
-        "ref_msg_id":          data["referenced_message"]["id"].as_str(),
-        "int_data":            data["interaction_metadata"].as_str(),
-        "components":          data["components"].as_str(),
-        "stickers":            data["stickers"].as_str(),
-        "pos":                 data["position"].as_number(),
-        "resolved":            data["resolved"].as_str(),
-        "poll":                data["poll"].as_str(),
+        "referenced_message_id": data["referenced_message"]["id"].as_str(),
+        "position":            data["position"].as_number(),
     };
 
     // Send message record to database
